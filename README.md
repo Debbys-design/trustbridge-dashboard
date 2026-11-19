@@ -501,3 +501,6 @@ This project is licensed under the [MIT License](LICENSE).
 - #590: Implement profile wallet verification status badges with tests
 <!-- handsoff-issue-532 -->
 - #532: Add RBAC tests for maintainer vs contributor on /api/disputes
+
+<!-- handsoff-issue-612 -->
+- #612: Document SECURITY considerations for webhook replay tooling
