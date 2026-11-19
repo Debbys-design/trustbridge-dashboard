@@ -504,3 +504,6 @@ This project is licensed under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-612 -->
 - #612: Document SECURITY considerations for webhook replay tooling
+
+<!-- handsoff-issue-617 -->
+- #617: Implement contributor table column preference persistence per org
