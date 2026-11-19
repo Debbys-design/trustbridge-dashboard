@@ -21,6 +21,13 @@ export interface NotReadyEntry {
   reason: "unfunded" | "no_trustline" | "low_reserve";
 }
 
+export interface SlaBreachEntry {
+  disputeId: string;
+  /** Deep link to the dispute detail page (no PII beyond the id). */
+  url: string;
+  ageHours: number;
+}
+
 export interface DigestResult {
   status: DigestStatus;
   startedAt: string;
@@ -32,6 +39,10 @@ export interface DigestResult {
   notReadyCount?: number;
   /** Set when DIGEST_INCLUDE_FULL_LIST=true */
   notReadyList?: NotReadyEntry[];
+  /** Count of disputes older than the configured SLA threshold. */
+  slaBreachCount?: number;
+  /** Set when DIGEST_INCLUDE_FULL_LIST=true */
+  slaBreachList?: SlaBreachEntry[];
   destination?: string;
   emailSent?: boolean;
   error?: string;
@@ -96,6 +107,27 @@ export function isFullListEnabled(): boolean {
   return raw === "true" || raw === "1" || raw === "yes";
 }
 
+/**
+ * Dispute SLA threshold in hours. Disputes older than this are flagged as
+ * SLA breaches in the digest. Defaults to 72 hours.
+ */
+export function getDisputeSlaHours(): number {
+  const parsed = Number.parseInt(process.env.DISPUTE_SLA_HOURS ?? "72", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 72;
+}
+
+/**
+ * Base URL used to build deep links in the digest. Falls back to the
+ * configured app URL, then to a relative path so links never leak hosts.
+ */
+function getAppBaseUrl(): string {
+  const raw =
+    process.env.NEXT_PUBLIC_APP_URL?.trim() ||
+    process.env.APP_URL?.trim() ||
+    "";
+  return raw.replace(/\/+$/, "");
+}
+
 // ---------------------------------------------------------------------------
 // Rate gate (in-process; mirrors cron-export.ts)
 // ---------------------------------------------------------------------------
@@ -124,6 +156,47 @@ function resolveReason(
   if (c.readiness === "low_reserve") return "low_reserve";
   if (!c.funded) return "unfunded";
   return "no_trustline";
+}
+
+// ---------------------------------------------------------------------------
+// SLA breach detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Find disputes that have exceeded the configured SLA threshold.
+ *
+ * Only open disputes (not resolved/dismissed) are considered. Returns a
+ * count plus, when the full list is enabled, deep links keyed by dispute id
+ * so no contributor PII is leaked beyond the existing masking policy.
+ */
+export async function findDisputeSlaBreaches(
+  now: number = Date.now(),
+  includeFullList: boolean = isFullListEnabled()
+): Promise<{ count: number; list: SlaBreachEntry[] }> {
+  const slaHours = getDisputeSlaHours();
+  const cutoff = new Date(now - slaHours * 60 * 60 * 1000);
+  const baseUrl = getAppBaseUrl();
+
+  const disputes = await prisma.dispute.findMany({
+    where: {
+      status: { in: ["open", "under_review"] },
+      createdAt: { lt: cutoff },
+    },
+    select: { id: true, createdAt: true },
+    orderBy: { createdAt: "asc" },
+  });
+
+  const list: SlaBreachEntry[] = includeFullList
+    ? disputes.map((d) => ({
+        disputeId: d.id,
+        url: `${baseUrl}/disputes/${d.id}`,
+        ageHours: Math.floor(
+          (now - new Date(d.createdAt).getTime()) / (60 * 60 * 1000)
+        ),
+      }))
+    : [];
+
+  return { count: disputes.length, list };
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +285,9 @@ export async function runCronDigest(
       }
     }
 
+    // ── Dispute SLA breaches ─────────────────────────────────────────────────
+    const slaBreaches = await findDisputeSlaBreaches(now, includeFullList);
+
     // ── Email ─────────────────────────────────────────────────────────────────
     const destination =
       options.destinationEmail?.trim() || getDigestDestinationEmail();
@@ -226,6 +302,8 @@ export async function runCronDigest(
         lowReserveCount,
         notReadyCount,
         notReadyList: includeFullList ? notReadyList : undefined,
+        slaBreachCount: slaBreaches.count,
+        slaBreachList: includeFullList ? slaBreaches.list : undefined,
         generatedAt: startedAt,
       });
 
@@ -243,6 +321,7 @@ export async function runCronDigest(
       logger.info("cron_digest_no_destination_configured", {
         totalContributors,
         notReadyCount,
+        slaBreachCount: slaBreaches.count,
       });
     }
 
@@ -251,21 +330,16 @@ export async function runCronDigest(
     await recordAuditLog({
       action: "digest.cron",
       actorId: options.actorId ?? null,
-      actorLogin: options.actorLogin ?? "scheduler:cron",
       metadata: {
         cadence,
         totalContributors,
-        readyCount,
-        lowReserveCount,
         notReadyCount,
-        includeFullList,
-        destination: destination || "none",
+        slaBreachCount: slaBreaches.count,
         emailSent,
-        durationMs,
       },
     });
 
-    lastResult = {
+    const result: DigestResult = {
       status: "ok",
       startedAt,
       durationMs,
@@ -275,39 +349,42 @@ export async function runCronDigest(
       lowReserveCount,
       notReadyCount,
       notReadyList: includeFullList ? notReadyList : undefined,
+      slaBreachCount: slaBreaches.count,
+      slaBreachList: includeFullList ? slaBreaches.list : undefined,
       destination: destination || undefined,
       emailSent,
     };
 
+    lastResult = result;
     logger.info("cron_digest_completed", {
-      totalContributors,
-      readyCount,
-      notReadyCount,
-      cadence,
       durationMs,
+      notReadyCount,
+      slaBreachCount: slaBreaches.count,
+      emailSent,
     });
 
-    return lastResult;
-  } catch (error) {
+    return result;
+  } catch (err) {
     const durationMs = Date.now() - now;
-    const message = error instanceof Error ? error.message : String(error);
+    const message = err instanceof Error ? err.message : String(err);
 
     logger.error("cron_digest_failed", { error: message, durationMs });
 
     await recordAuditLog({
-      action: "digest.cron.failed",
+      action: "digest.cron",
       actorId: options.actorId ?? null,
-      actorLogin: options.actorLogin ?? "scheduler:cron",
-      metadata: { error: message, durationMs },
-    });
+      metadata: { error: message },
+    }).catch(() => undefined);
 
-    lastResult = {
+    const result: DigestResult = {
       status: "error",
       startedAt,
       durationMs,
+      cadence,
       error: message,
     };
 
-    return lastResult;
+    lastResult = result;
+    return result;
   }
 }
